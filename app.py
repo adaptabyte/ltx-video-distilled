@@ -11,27 +11,28 @@ import tempfile
 from PIL import Image
 from huggingface_hub import hf_hub_download
 import shutil
+import gc # For garbage collection
+import sys # For sys.exit()
 
 from inference import (
     create_ltx_video_pipeline,
     create_latent_upsampler,
     load_image_to_tensor_with_resize_and_crop,
     seed_everething,
-    get_device, # Not used directly in app.py but inference.py uses it
+    get_device,
     calculate_padding,
     load_media_file
 )
 from ltx_video.pipelines.pipeline_ltx_video import ConditioningItem, LTXMultiScalePipeline, LTXVideoPipeline
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
 
-# Changed to the 2B distilled model config
 config_file_path = "configs/ltxv-2b-0.9.6-distilled.yaml"
 with open(config_file_path, "r") as file:
     PIPELINE_CONFIG_YAML = yaml.safe_load(file)
 
 LTX_REPO = "Lightricks/LTX-Video"
-MAX_IMAGE_SIZE = PIPELINE_CONFIG_YAML.get("max_resolution", 1280) # 2B config doesn't have this, defaults to 1280
-MAX_NUM_FRAMES = 257 # Max frames user can request via duration.
+MAX_IMAGE_SIZE = PIPELINE_CONFIG_YAML.get("max_resolution", 1280)
+MAX_NUM_FRAMES = 257
 
 FPS = 30.0
 
@@ -51,7 +52,6 @@ distilled_model_actual_path = hf_hub_download(
 PIPELINE_CONFIG_YAML["checkpoint_path"] = distilled_model_actual_path
 print(f"Distilled model path: {distilled_model_actual_path}")
 
-# Spatial upscaler might not be defined in the 2B config
 SPATIAL_UPSCALER_FILENAME = PIPELINE_CONFIG_YAML.get("spatial_upscaler_model_path")
 if SPATIAL_UPSCALER_FILENAME:
     spatial_upscaler_actual_path = hf_hub_download(
@@ -65,44 +65,75 @@ if SPATIAL_UPSCALER_FILENAME:
 else:
     print("Spatial upscaler model path not defined in config. Multi-scale will not be available.")
 
-
-print("Creating LTX Video pipeline on CPU...")
+print("Creating LTX Video pipeline on CPU (initial load)...")
 pipeline_instance = create_ltx_video_pipeline(
     ckpt_path=PIPELINE_CONFIG_YAML["checkpoint_path"],
     precision=PIPELINE_CONFIG_YAML["precision"],
     text_encoder_model_name_or_path=PIPELINE_CONFIG_YAML["text_encoder_model_name_or_path"],
     sampler=PIPELINE_CONFIG_YAML["sampler"],
     device="cpu",
-    enhance_prompt=False, # Keep false for Gradio app simplicity
+    enhance_prompt=False,
     prompt_enhancer_image_caption_model_name_or_path=PIPELINE_CONFIG_YAML.get("prompt_enhancer_image_caption_model_name_or_path"),
     prompt_enhancer_llm_model_name_or_path=PIPELINE_CONFIG_YAML.get("prompt_enhancer_llm_model_name_or_path"),
 )
 print("LTX Video pipeline created on CPU.")
 
 if PIPELINE_CONFIG_YAML.get("spatial_upscaler_model_path"):
-    print("Creating latent upsampler on CPU...")
+    print("Creating latent upsampler on CPU (initial load)...")
     latent_upsampler_instance = create_latent_upsampler(
         PIPELINE_CONFIG_YAML["spatial_upscaler_model_path"],
         device="cpu"
     )
     print("Latent upsampler created on CPU.")
 else:
-    latent_upsampler_instance = None # Ensure it's None if no path
+    latent_upsampler_instance = None
 
 target_inference_device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Target inference device: {target_inference_device}")
 
 if target_inference_device == "cpu":
-    print("WARNING: Running on CPU. Inference will be very slow.")
+    print("ERROR: CUDA GPU not available or not detected. This application requires a GPU to run effectively.")
+    print("Please ensure you have a CUDA-enabled GPU and the correct drivers/PyTorch version.")
+    print("Terminating application.")
+    sys.exit(1) # Terminate if no GPU from the start
 
-pipeline_instance.to(target_inference_device)
-if latent_upsampler_instance:
-    latent_upsampler_instance.to(target_inference_device)
+print("Attempting to move models to GPU...")
+gc.collect()
+torch.cuda.empty_cache()
+try:
+    pipeline_instance.to(target_inference_device)
+    print("Pipeline instance moved to GPU.")
+    if latent_upsampler_instance: # Will be False for 2B distilled config
+        gc.collect()
+        torch.cuda.empty_cache()
+        latent_upsampler_instance.to(target_inference_device)
+        print("Latent upsampler instance moved to GPU.")
+except RuntimeError as e:
+    if "CUDA out of memory" in str(e).lower():
+        print(f"FATAL: CUDA Out of Memory Error when trying to load models to GPU: {e}")
+        print("This GPU does not have enough memory for the selected model configuration.")
+        print("Try reducing resolution/duration, or using a GPU with more VRAM.")
+        print("Terminating application.")
+        # Clean up potentially partially moved models before exiting
+        del pipeline_instance
+        if latent_upsampler_instance: del latent_upsampler_instance
+        gc.collect()
+        torch.cuda.empty_cache()
+        sys.exit(1) # Terminate on OOM
+    else: # Other RuntimeError
+        print(f"FATAL: An unexpected RuntimeError occurred when moving models to GPU: {e}")
+        print("Terminating application.")
+        sys.exit(1)
+except Exception as e_other: # Catch any other exception during .to()
+    print(f"FATAL: An unexpected error occurred when moving models to GPU: {e_other}")
+    print("Terminating application.")
+    sys.exit(1)
+
+print("Models successfully loaded to GPU.")
 
 
 # --- Helper function for dimension calculation ---
 MIN_DIM_SLIDER = 256
-# Adjusted for 2B model, 768 might be too large for common GPUs with this model
 TARGET_FIXED_SIDE = 512
 
 def calculate_new_dimensions(orig_w, orig_h):
@@ -132,15 +163,12 @@ def get_duration_gpu(prompt, negative_prompt, input_image_filepath, input_video_
              ui_frames_to_use,
              seed_ui, randomize_seed, ui_guidance_scale, improve_texture_flag,
              progress):
-    # Simplified duration for Kaggle, depends on GPU type
-    # P100/T4 might need shorter times than A100
-    # This is a rough estimate. For 2B model, keep it modest.
-    if duration_ui > 5: # 5 seconds
-        return 90 # 1.5 minutes
-    elif duration_ui > 2: # 2 seconds
-        return 60 # 1 minute
+    if duration_ui > 5:
+        return 90
+    elif duration_ui > 2:
+        return 60
     else:
-        return 45 # 45 seconds
+        return 45
 
 
 @spaces.GPU(duration_fn=get_duration_gpu)
@@ -195,7 +223,7 @@ def generate(prompt, negative_prompt, input_image_filepath, input_video_filepath
         "is_video": True,
         "vae_per_channel_normalize": True,
         "mixed_precision": (PIPELINE_CONFIG_YAML["precision"] == "mixed_precision"),
-        "offload_to_cpu": False, # Managed by app if needed
+        "offload_to_cpu": False,
         "enhance_prompt": False,
     }
 
@@ -234,8 +262,6 @@ def generate(prompt, negative_prompt, input_image_filepath, input_video_filepath
             print(f"Error loading video {input_video_filepath}: {e}")
             raise gr.Error(f"Could not load video: {e}")
 
-    print(f"Moving models to {target_inference_device} for inference (if not already there)...")
-
     active_latent_upsampler = None
     if improve_texture_flag and latent_upsampler_instance:
         active_latent_upsampler = latent_upsampler_instance
@@ -247,9 +273,6 @@ def generate(prompt, negative_prompt, input_image_filepath, input_video_filepath
 
         multi_scale_pipeline_obj = LTXMultiScalePipeline(pipeline_instance, active_latent_upsampler)
 
-        # Multi-scale configs usually have first_pass/second_pass
-        # The 2B config is 'base' type so this path might not be fully compatible without config changes
-        # or will error due to missing upsampler.
         first_pass_args = PIPELINE_CONFIG_YAML.get("first_pass", {}).copy()
         first_pass_args["guidance_scale"] = float(ui_guidance_scale)
         first_pass_args.pop("num_inference_steps", None)
@@ -260,32 +283,30 @@ def generate(prompt, negative_prompt, input_image_filepath, input_video_filepath
 
         multi_scale_call_kwargs = call_kwargs.copy()
         multi_scale_call_kwargs.update({
-            "downscale_factor": PIPELINE_CONFIG_YAML["downscale_factor"], # May not exist in 2B config
+            "downscale_factor": PIPELINE_CONFIG_YAML["downscale_factor"],
             "first_pass": first_pass_args,
             "second_pass": second_pass_args,
         })
 
         print(f"Calling multi-scale pipeline (eff. HxW: {actual_height}x{actual_width}, Frames: {actual_num_frames} -> Padded: {num_frames_padded}) on {target_inference_device}")
         result_images_tensor = multi_scale_pipeline_obj(**multi_scale_call_kwargs).images
-    else: # Single-pass
+    else:
         single_pass_call_kwargs = call_kwargs.copy()
 
         if PIPELINE_CONFIG_YAML.get("pipeline_type") == "multi-scale":
-            # Fallback for multi-scale config but improve_texture=False
             first_pass_config = PIPELINE_CONFIG_YAML.get("first_pass", {})
             single_pass_call_kwargs["timesteps"] = first_pass_config.get("timesteps")
             single_pass_call_kwargs["stg_scale"] = first_pass_config.get("stg_scale")
             single_pass_call_kwargs["rescaling_scale"] = first_pass_config.get("rescaling_scale")
             single_pass_call_kwargs["skip_block_list"] = first_pass_config.get("skip_block_list")
-            # num_inference_steps will be derived from timesteps or pipeline default
-        else: # 'base' pipeline_type (like the 2B distilled model)
-            single_pass_call_kwargs["timesteps"] = PIPELINE_CONFIG_YAML.get("timesteps") # Usually None for 'base'
+        else:
+            single_pass_call_kwargs["timesteps"] = PIPELINE_CONFIG_YAML.get("timesteps")
             single_pass_call_kwargs["stg_scale"] = PIPELINE_CONFIG_YAML.get("stg_scale")
             single_pass_call_kwargs["rescaling_scale"] = PIPELINE_CONFIG_YAML.get("rescaling_scale")
             single_pass_call_kwargs["skip_block_list"] = PIPELINE_CONFIG_YAML.get("skip_block_list")
             single_pass_call_kwargs["num_inference_steps"] = PIPELINE_CONFIG_YAML.get("num_inference_steps")
 
-        single_pass_call_kwargs["guidance_scale"] = float(ui_guidance_scale) # UI overrides YAML
+        single_pass_call_kwargs["guidance_scale"] = float(ui_guidance_scale)
 
         single_pass_call_kwargs.pop("first_pass", None)
         single_pass_call_kwargs.pop("second_pass", None)
@@ -315,7 +336,6 @@ def generate(prompt, negative_prompt, input_image_filepath, input_video_filepath
     output_video_path = os.path.join(temp_dir, f"output_{timestamp}.mp4")
 
     try:
-        # Try with macro_block_size=1 first for better quality with some codecs if available
         with imageio.get_writer(output_video_path, fps=call_kwargs["frame_rate"], macro_block_size=1) as video_writer:
             for frame_idx in range(video_np.shape[0]):
                 progress(frame_idx / video_np.shape[0], desc="Saving video")
@@ -323,14 +343,12 @@ def generate(prompt, negative_prompt, input_image_filepath, input_video_filepath
     except Exception as e:
         print(f"Error saving video with macro_block_size=1: {e}. Falling back to FFMPEG libx264.")
         try:
-            # Fallback to FFMPEG with libx264, which is widely available
             with imageio.get_writer(output_video_path, fps=call_kwargs["frame_rate"], format='FFMPEG', codec='libx264', quality=8) as video_writer:
                  for frame_idx in range(video_np.shape[0]):
                     progress(frame_idx / video_np.shape[0], desc="Saving video (fallback ffmpeg)")
                     video_writer.append_data(video_np[frame_idx])
         except Exception as e2:
             print(f"Fallback video saving error: {e2}")
-            # If even FFMPEG fails, try default imageio writer without specific codec
             try:
                 with imageio.get_writer(output_video_path, fps=call_kwargs["frame_rate"]) as video_writer:
                     for frame_idx in range(video_np.shape[0]):
@@ -351,7 +369,6 @@ def update_task_text():
 def update_task_video():
     return "video-to-video"
 
-# --- Gradio UI Definition ---
 css="""
 #col-container {
     margin: 0 auto;
@@ -360,7 +377,6 @@ css="""
 """
 
 with gr.Blocks(css=css) as demo:
-    # Changed title to reflect the new model
     gr.Markdown("# LTX Video 0.9.6 Distilled (2B)")
     gr.Markdown("Fast video generation. [Model Hub](https://huggingface.co/Lightricks/LTX-Video) [GitHub](https://github.com/Lightricks/LTX-Video)")
 
@@ -376,7 +392,7 @@ with gr.Blocks(css=css) as demo:
                 video_n_hidden = gr.Textbox(label="video_n", visible=False, value=None)
                 t2v_prompt = gr.Textbox(label="Prompt", value="A majestic dragon flying over a medieval castle", lines=3)
                 t2v_button = gr.Button("Generate Text-to-Video", variant="primary")
-            with gr.Tab("video-to-video", visible=True) as video_tab: # Made visible for testing
+            with gr.Tab("video-to-video", visible=True) as video_tab:
                 image_v_hidden = gr.Textbox(label="image_v", visible=False, value=None)
                 video_v2v = gr.Video(label="Input Video", sources=["upload", "webcam"])
                 frames_to_use = gr.Slider(label="Frames to use from input video", minimum=9, maximum=MAX_NUM_FRAMES, value=9, step=8, info="Number of initial frames to use for conditioning/transformation. Must be N*8+1.")
@@ -386,7 +402,7 @@ with gr.Blocks(css=css) as demo:
             duration_input = gr.Slider(
                 label="Video Duration (seconds)",
                 minimum=0.3,
-                maximum=8.5, # Corresponds to MAX_NUM_FRAMES at 30 FPS
+                maximum=8.5,
                 value=2,
                 step=0.1,
                 info=f"Target video duration (0.3s to {MAX_NUM_FRAMES/FPS:.1f}s)"
@@ -403,11 +419,10 @@ with gr.Blocks(css=css) as demo:
             seed_input = gr.Number(label="Seed", value=42, precision=0, minimum=0, maximum=2**32-1)
             randomize_seed_input = gr.Checkbox(label="Randomize Seed", value=True)
         with gr.Row():
-            # Adjusted default guidance scale based on typical 2B model configs
             guidance_scale_input = gr.Slider(label="Guidance Scale (CFG)", minimum=1.0, maximum=10.0, value=PIPELINE_CONFIG_YAML.get("guidance_scale", 1.0), step=0.1, info="Controls how much the prompt influences the output. Higher values = stronger influence.")
         with gr.Row():
-            height_input = gr.Slider(label="Height", value=TARGET_FIXED_SIDE, step=32, minimum=MIN_DIM_SLIDER, maximum=MAX_IMAGE_SIZE, info="Must be divisible by 32.") # Default to TARGET_FIXED_SIDE
-            width_input = gr.Slider(label="Width", value=TARGET_FIXED_SIDE, step=32, minimum=MIN_DIM_SLIDER, maximum=MAX_IMAGE_SIZE, info="Must be divisible by 32.") # Default to TARGET_FIXED_SIDE
+            height_input = gr.Slider(label="Height", value=TARGET_FIXED_SIDE, step=32, minimum=MIN_DIM_SLIDER, maximum=MAX_IMAGE_SIZE, info="Must be divisible by 32.")
+            width_input = gr.Slider(label="Width", value=TARGET_FIXED_SIDE, step=32, minimum=MIN_DIM_SLIDER, maximum=MAX_IMAGE_SIZE, info="Must be divisible by 32.")
 
 
     def handle_image_upload_for_dims(image_filepath, current_h, current_w):
@@ -465,12 +480,12 @@ with gr.Blocks(css=css) as demo:
         inputs=[video_v2v, height_input, width_input],
         outputs=[height_input, width_input]
     )
-    video_v2v.clear( # Reset to default if video is cleared
+    video_v2v.clear(
         fn=lambda: (gr.update(value=TARGET_FIXED_SIDE), gr.update(value=TARGET_FIXED_SIDE)),
         inputs=None,
         outputs=[height_input, width_input]
     )
-    image_i2v.clear( # Reset to default if image is cleared
+    image_i2v.clear(
         fn=lambda: (gr.update(value=TARGET_FIXED_SIDE), gr.update(value=TARGET_FIXED_SIDE)),
         inputs=None,
         outputs=[height_input, width_input]
@@ -485,7 +500,7 @@ with gr.Blocks(css=css) as demo:
         fn=update_task_text,
         outputs=[mode]
     )
-    video_tab.select( # Added select handler for video tab
+    video_tab.select(
         fn=update_task_video,
         outputs=[mode]
     )
@@ -513,5 +528,4 @@ if __name__ == "__main__":
     if os.path.exists(models_dir) and os.path.isdir(models_dir):
         print(f"Model directory: {Path(models_dir).resolve()}")
 
-    # For Kaggle, share=True is usually needed. debug=False for cleaner output.
     demo.queue().launch(debug=False, share=True)
